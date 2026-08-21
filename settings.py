@@ -19,7 +19,7 @@ LYRICS_ENABLED: bool = True
 #   stage 1: LRCLIB exact match, then LRCLIB fuzzy search
 #   stage 2 (only if stage 1 had no synced lyrics): NetEase + Kugou in parallel
 LYRICS_PROVIDER_TIMEOUT_SEC: float = 6.0    # per provider HTTP timeout
-LYRICS_USER_AGENT: str = "MusicVisualizer/1.0 (https://github.com/local/music-visualizer)"
+LYRICS_USER_AGENT: str = "MusicVisualizer/1.0 (https://github.com/techwizmatt/music-visualizer)"
 
 LRCLIB_BASE_URL: str = "https://lrclib.net"
 
