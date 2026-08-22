@@ -6,10 +6,14 @@ Live audio capture + analysis from a loopback input device (BlackHole).
 Two background threads:
   * device manager — owns the sounddevice InputStream, reconnects if the
     device vanishes. The PortAudio callback writes mono samples into a ring
-    buffer.
+    buffer and queues the untouched stereo float stream for recording.
   * beat thread — consumes the ring in fixed 512-sample hops, feeds the
-    BeatTracker (onset envelope -> tempo -> phase), records the per-track
-    analysis profile, and persists it to the AnalysisCache.
+    BeatTracker (onset envelope -> tempo -> phase).
+
+The now-playing timestamp also maps every captured block into a deterministic
+per-track WAV.  On a later exact metadata+duration match, a full-file profile
+is loaded/generated in a background process.  Live analysis remains active
+until that profile is ready, then snapshots are read from it at track time.
 
 `snapshot()` (UI thread, every frame) returns smoothed band levels plus the
 PREDICTED beat clock evaluated slightly in the future
@@ -19,6 +23,9 @@ is confident, reactive pulse otherwise.
 """
 
 import math
+import ctypes
+import queue
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -26,9 +33,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from beat import HOP, AnalysisCache, BeatTracker, LoadedProfile, TrackProfile
+from beat import HOP, BeatTracker
+from recording import FullTrackProfile, TrackFileManager, TrackIdentity
 from settings import (
     AUDIO_BLOCK_SIZE,
+    AUDIO_CAPTURE_QUEUE_BLOCKS,
     AUDIO_DEVICE_SUBSTRING,
     AUDIO_ENABLED,
     AUDIO_FFT_SIZE,
@@ -45,6 +54,19 @@ except Exception:  # pragma: no cover - missing portaudio etc.
     sd = None
 
 
+def _set_audio_thread_priority(qos_class: int) -> None:
+    """Apply a Darwin QoS class when available; remain portable otherwise."""
+    if sys.platform != "darwin":
+        return
+    try:
+        fn = ctypes.CDLL(None).pthread_set_qos_class_self_np
+        fn.argtypes = (ctypes.c_uint, ctypes.c_int)
+        fn.restype = ctypes.c_int
+        fn(int(qos_class), 0)
+    except Exception:
+        pass
+
+
 @dataclass
 class AudioLevels:
     """Everything the visualizer needs, all values already smoothed to [0..1]."""
@@ -56,13 +78,33 @@ class AudioLevels:
     high: float = 0.0                # ~2-9 kHz
     pulse: float = 0.0               # reactive bass transient (no prediction)
     bands: List[float] = field(default_factory=list)  # 24 log-spaced bins 0..1
-    status: str = "off"              # off | no-device | starting | ok | silent
+    waveform: List[float] = field(default_factory=list)  # signed 64-point audio trace
+    waveform_timeline: List[List[float]] = field(default_factory=list)
+    waveform_timeline_center: int = 0
+    status: str = "off"              # off | no-device | starting | ok | silent | file
+    source: str = "live"             # live | full-file
     # --- predicted beat clock (evaluated with lookahead) ---
     bpm: float = 0.0
     beat_conf: float = 0.0
     beat_phase: float = 0.0          # 0 on the (predicted) beat
     beat: float = 0.0                # blended pulse: use THIS to drive visuals
-    energy_ahead: float = 0.0        # cached profile's loudness ~1.5s ahead
+    energy_ahead: float = 0.0        # full-file profile loudness ~1.5s ahead
+    # --- complete-file-only detail, indexed from the now-playing clock ---
+    vocal: float = 0.0               # voice-like harmonic energy, not source separation
+    brightness: float = 0.0          # normalized spectral centroid
+    spectral_flux: float = 0.0       # dense note/transient activity
+    stereo_width: float = 0.0        # side energy relative to centered energy
+    section: float = 0.0             # stable normalized section identifier
+    section_change: float = 0.0      # decaying pulse at detected boundaries
+    music_motion: float = 0.0        # sustained full-spectrum activity
+    energy_flow: float = 0.0         # -1 release/implode .. +1 build/explode
+    spectral_shift: float = 0.0      # -1 darker/downward .. +1 brighter/upward
+    climax: float = 0.0              # combined high-point/drop strength
+    track_intensity: float = 0.0     # relative slow passage .. dense passage
+    buildup: float = 0.0             # sustained structural rise (-1 release)
+    anticipation: float = 0.0        # smooth ramp into a detected large jump
+    drop: float = 0.0                # chorus/drop impact with a soft decay
+    calmness: float = 0.0            # relative slow-section strength
 
 
 def _band_edges(n_bands: int, f_lo: float, f_hi: float) -> np.ndarray:
@@ -84,6 +126,14 @@ class AudioAnalyzer:
         self._stream = None
         self._stop = False
         self._thread: Optional[threading.Thread] = None
+        self._capture_thread: Optional[threading.Thread] = None
+        self._capture_queue: "queue.Queue[Optional[Tuple[np.ndarray, float, float]]]" = queue.Queue(
+            maxsize=max(64, int(AUDIO_CAPTURE_QUEUE_BLOCKS))
+        )
+        self._capture_ready = threading.Event()
+        self._capture_queue_drops = 0
+        self._input_overflows = 0
+        self._capture_peak = 0.0
         self._status = "off"
 
         # Analysis state (only touched from the snapshot() caller's thread)
@@ -101,22 +151,17 @@ class AudioAnalyzer:
 
         # --- beat engine ---
         self._tracker = BeatTracker(self._samplerate)
-        self._cache = AnalysisCache()
         self._beat_thread: Optional[threading.Thread] = None
         self._total_read = 0
         self._prev_tail = np.zeros(HOP, dtype=np.float32)
         self._stream_mono_off: Optional[float] = None   # mono_t - stream_t
         self._last_estimate_t = 0.0
-        self._last_profile_t = 0.0
-        self._last_save_t = 0.0
 
         self._track_lock = threading.Lock()
         self._sig = ""
-        self._duration = 0
-        self._profile: Optional[TrackProfile] = None
-        self._loaded: Optional[LoadedProfile] = None
-        self._pending_grid_seed = False
-        self._pos_pair: Optional[Tuple[float, float]] = None  # (track_pos, mono_t)
+        self._full_profile: Optional[FullTrackProfile] = None
+        self._pos_pair: Optional[Tuple[float, float, bool]] = None
+        self._files = TrackFileManager(self._on_full_profile)
 
     # ---------- lifecycle ----------
 
@@ -126,6 +171,13 @@ class AudioAnalyzer:
             return
         if self._thread is not None:
             return
+        self._files.start()
+        self._capture_thread = threading.Thread(
+            target=self._capture_run,
+            name="audio-capture-priority",
+            daemon=True,
+        )
+        self._capture_thread.start()
         self._thread = threading.Thread(target=self._run, name="audio-analyzer", daemon=True)
         self._thread.start()
         if BEAT_ENABLED:
@@ -134,42 +186,68 @@ class AudioAnalyzer:
 
     def stop(self) -> None:
         self._stop = True
-        self._save_analysis(final=True)
         self._close_stream()
+        try:
+            self._capture_queue.put(None, timeout=1.0)
+        except queue.Full:
+            pass
+        if self._capture_thread is not None:
+            self._capture_thread.join(timeout=3.0)
+        self._files.stop()
 
     # ---------- track context (called from the UI thread) ----------
 
-    def set_track(self, sig: str, duration_sec: float) -> None:
-        """New now-playing track: persist the previous track's analysis and
-        warm-start from this track's cached profile if we have one."""
+    def set_track(
+        self,
+        sig: str,
+        duration_sec: float,
+        title: str = "",
+        artist: str = "",
+        album: str = "",
+        genre: str = "",
+        track_number: Optional[int] = None,
+        total_track_count: Optional[int] = None,
+        source_app: str = "",
+        content_identifier: str = "",
+    ) -> None:
+        """Close the old file boundary and select the exact new media file."""
         with self._track_lock:
             if sig == self._sig:
                 return
-        self._save_analysis(final=True)
-        with self._track_lock:
+            duration = float(max(0.0, duration_sec or 0.0))
             self._sig = sig
-            self._duration = int(max(0, duration_sec or 0))
-            self._profile = TrackProfile(sig, self._duration) if self._duration > 0 else None
-            self._loaded = self._cache.load(sig)
-            self._pending_grid_seed = bool(
-                self._loaded and self._loaded.bpm > 0 and self._loaded.beat_offset is not None
+            self._full_profile = None
+            self._pos_pair = None
+        self._files.set_track(
+            TrackIdentity(
+                sig=sig,
+                title=title,
+                artist=artist,
+                album=album,
+                duration=duration,
+                genre=genre,
+                track_number=track_number,
+                total_track_count=total_track_count,
+                source_app=source_app,
+                content_identifier=content_identifier,
             )
-            if self._loaded and self._loaded.bpm > 0:
-                self._tracker.set_prior_bpm(self._loaded.bpm)
+        )
 
-    def note_position(self, pos_sec: float) -> None:
-        """UI feeds the current track position every frame (cheap)."""
-        self._pos_pair = (float(pos_sec), time.monotonic())
+    def note_artwork(self, artwork_bytes: Optional[bytes]) -> None:
+        self._files.note_artwork(artwork_bytes)
 
-    def _track_pos_now(self) -> Optional[float]:
-        pair = self._pos_pair
-        if pair is None:
-            return None
-        pos, stamp = pair
-        age = time.monotonic() - stamp
-        if age > 2.0:
-            return None
-        return pos + min(age, 0.1)
+    def _on_full_profile(self, sig: str, profile: FullTrackProfile) -> None:
+        """Called off the UI thread after a saved file has been analyzed."""
+        with self._track_lock:
+            if sig == self._sig:
+                self._full_profile = profile
+
+    def note_position(self, pos_sec: float, playing: bool = True) -> None:
+        """Feed exact media time/state to both recording and file playback."""
+        now = time.monotonic()
+        with self._track_lock:
+            self._pos_pair = (float(pos_sec), now, bool(playing))
+        self._files.note_position(pos_sec, playing)
 
     # ---------- device management ----------
 
@@ -207,7 +285,11 @@ class AudioAnalyzer:
         except Exception:
             default_sr = float(AUDIO_PREFERRED_SAMPLERATE)
 
-        for sr in (float(AUDIO_PREFERRED_SAMPLERATE), default_sr):
+        # MP3 supports at most 48 kHz. Capture float32 stereo at that rate so
+        # the encoder receives its highest useful quality without the 4x
+        # callback/disk load of a 192 kHz BlackHole configuration.
+        sample_rates = tuple(dict.fromkeys((float(AUDIO_PREFERRED_SAMPLERATE), default_sr)))
+        for sr in sample_rates:
             try:
                 # Reset the hop reader and tracker for the new stream clock.
                 with self._lock:
@@ -225,15 +307,21 @@ class AudioAnalyzer:
                     dtype="float32",
                     callback=self._callback,
                 )
+                # Set before start(): CoreAudio may invoke the first callback
+                # synchronously as the stream transitions to active.
+                self._samplerate = sr
+                self._capture_ready.clear()
                 stream.start()
                 self._stream = stream
-                self._samplerate = sr
                 return True
             except Exception:
                 continue
         return False
 
     def _run(self) -> None:
+        # Device discovery/reconnect is intentionally lower priority than the
+        # worker that drains already-arrived CoreAudio blocks.
+        _set_audio_thread_priority(0x11)  # QOS_CLASS_UTILITY
         while not self._stop:
             if self._stream is not None:
                 try:
@@ -254,32 +342,89 @@ class AudioAnalyzer:
 
             self._status = "starting"
             if self._open_stream(idx):
+                # "ok" means BlackHole is delivering frames, not merely that
+                # CoreAudio accepted the open request.
+                self._capture_ready.wait(timeout=1.0)
                 self._status = "ok"
             else:
                 self._status = "no-device"
                 time.sleep(AUDIO_RECONNECT_SEC)
 
     def _callback(self, indata, frames, time_info, status) -> None:  # noqa: ANN001
+        """Real-time CoreAudio callback: one owned copy and a nonblocking put.
+
+        No FFT, downmix, timeline lookup, disk access, or recorder locking is
+        allowed here. Those operations run on the priority capture worker.
+        """
         try:
-            mono = indata.mean(axis=1) if indata.ndim == 2 else indata
-            n = len(mono)
-            with self._lock:
-                ring = self._ring
-                size = len(ring)
-                i = self._write_idx
-                first = min(n, size - i)
-                ring[i:i + first] = mono[:first]
-                rest = n - first
-                if rest > 0:
-                    ring[:rest] = mono[first:]
-                self._write_idx = (i + n) % size
-                self._total_written += n
+            callback_mono = time.monotonic()
+            packet_end_mono = callback_mono
+            # PortAudio reports when the first input sample reached the ADC.
+            # Convert its clock to monotonic at callback time, then use the
+            # block end for exact placement on the now-playing timeline.
+            try:
+                pa_now = float(getattr(time_info, "currentTime"))
+                pa_start = float(getattr(time_info, "inputBufferAdcTime"))
+                block_end = pa_start + float(frames) / max(1.0, self._samplerate)
+                input_delay = pa_now - block_end
+                if pa_now > 0.0 and pa_start > 0.0 and -0.05 <= input_delay <= 2.0:
+                    packet_end_mono = callback_mono - max(0.0, input_delay)
+            except (AttributeError, TypeError, ValueError):
+                pass
+            if status and bool(getattr(status, "input_overflow", False)):
+                self._input_overflows += 1
+            owned = np.array(indata, dtype=np.float32, order="C", copy=True)
+            try:
+                self._capture_queue.put_nowait((owned, self._samplerate, packet_end_mono))
+            except queue.Full:
+                self._capture_queue_drops += 1
         except Exception:
             pass
+
+    def _capture_run(self) -> None:
+        """High-priority bridge from CoreAudio to analysis and file writing."""
+        _set_audio_thread_priority(0x21)  # QOS_CLASS_USER_INTERACTIVE
+        while True:
+            try:
+                item = self._capture_queue.get(timeout=0.25)
+            except queue.Empty:
+                if self._stop:
+                    break
+                continue
+            if item is None:
+                break
+            samples, samplerate, callback_mono = item
+            try:
+                mono = (
+                    np.mean(samples, axis=1, dtype=np.float32)
+                    if samples.ndim == 2
+                    else samples
+                )
+                n = len(mono)
+                if n:
+                    peak = float(np.max(np.abs(samples)))
+                    self._capture_peak = max(peak, self._capture_peak * 0.998)
+                    self._capture_ready.set()
+                with self._lock:
+                    ring = self._ring
+                    size = len(ring)
+                    i = self._write_idx
+                    first = min(n, size - i)
+                    ring[i:i + first] = mono[:first]
+                    rest = n - first
+                    if rest > 0:
+                        ring[:rest] = mono[first:]
+                    self._write_idx = (i + n) % size
+                    self._total_written += n
+                self._files.push_audio_owned(samples, samplerate, callback_mono)
+            except Exception:
+                # A bad analysis block must never stop future capture blocks.
+                continue
 
     # ---------- beat thread ----------
 
     def _beat_run(self) -> None:
+        _set_audio_thread_priority(0x19)  # QOS_CLASS_USER_INITIATED
         while not self._stop:
             if self._stream is None:
                 time.sleep(0.25)
@@ -324,7 +469,6 @@ class AudioAnalyzer:
                     self._stream_mono_off = off
                 else:
                     self._stream_mono_off += (off - self._stream_mono_off) * 0.05
-                self._maybe_seed_grid()
 
             if now - self._last_estimate_t >= 0.5:
                 self._last_estimate_t = now
@@ -332,70 +476,7 @@ class AudioAnalyzer:
                     self._tracker.estimate()
                 except Exception:
                     pass
-            if now - self._last_profile_t >= 1.0:
-                self._last_profile_t = now
-                self._sample_profile()
-            if now - self._last_save_t >= 10.0:
-                self._last_save_t = now
-                self._save_analysis(final=False)
             time.sleep(0.03)
-
-    def _maybe_seed_grid(self) -> None:
-        with self._track_lock:
-            if not self._pending_grid_seed or self._loaded is None:
-                return
-            loaded = self._loaded
-        if self._stream_mono_off is None or loaded.bpm <= 0 or loaded.beat_offset is None:
-            return
-        pos = self._track_pos_now()
-        if pos is None:
-            return
-        period = 60.0 / loaded.bpm
-        beat_track_t = loaded.beat_offset + math.floor((pos - loaded.beat_offset) / period) * period
-        stream_now = time.monotonic() - self._stream_mono_off
-        anchor_stream = stream_now - (pos - beat_track_t)
-        self._tracker.seed_grid(period, anchor_stream, conf=0.4)
-        with self._track_lock:
-            self._pending_grid_seed = False
-
-    def _sample_profile(self) -> None:
-        if self._status != "ok" or self._sm_rms < 0.03:
-            return
-        pos = self._track_pos_now()
-        if pos is None:
-            return
-        with self._track_lock:
-            if self._profile is not None:
-                self._profile.add_sample(pos, self._sm_bass, self._sm_mid, self._sm_high, self._sm_rms)
-
-    def _beat_offset_in_track(self) -> Optional[float]:
-        if self._stream_mono_off is None:
-            return None
-        pos = self._track_pos_now()
-        if pos is None:
-            return None
-        q = self._tracker.query(time.monotonic() - self._stream_mono_off)
-        if q is None or q.period <= 0:
-            return None
-        return float((pos - q.time_since_beat) % q.period)
-
-    def _save_analysis(self, final: bool) -> None:
-        with self._track_lock:
-            sig, dur, profile = self._sig, self._duration, self._profile
-        if not sig:
-            return
-        q = self._tracker.query(self._tracker.stream_time)
-        if q is None or q.bpm <= 0:
-            return
-        worthy = q.conf >= 0.55 or (final and q.conf >= 0.35 and profile is not None
-                                    and profile.seconds_recorded >= 20)
-        if not worthy:
-            return
-        self._cache.save(
-            sig, q.bpm, q.conf,
-            beat_offset=self._beat_offset_in_track(),
-            profile=profile, duration=dur,
-        )
 
     # ---------- analysis ----------
 
@@ -429,20 +510,147 @@ class AudioAnalyzer:
                 if gate_ok and cg > 0.0:
                     predicted = math.exp(-q.time_since_beat / 0.11) * cg
                     beat = max(self._pulse * (1.0 - 0.55 * cg), predicted)
-        with self._track_lock:
-            loaded = self._loaded
-        if loaded is not None and loaded.has_energy:
-            pos = self._track_pos_now()
-            if pos is not None:
-                v = loaded.energy_at(pos + 1.5, "rms")
-                if v is not None:
-                    e_ahead = v
         return bpm, conf, phase, beat, e_ahead
+
+    def _full_file_snapshot(self) -> Optional[AudioLevels]:
+        with self._track_lock:
+            profile = self._full_profile
+            pair = self._pos_pair
+        if profile is None or pair is None:
+            return None
+        pos, stamp, playing = pair
+        age = time.monotonic() - stamp
+        if age > 2.0:
+            return None
+        if playing:
+            pos += min(age, 0.1)
+        if not playing:
+            return AudioLevels(
+                ok=True,
+                silent=True,
+                bands=[0.0] * self.N_BANDS,
+                status="file",
+                source="full-file",
+                bpm=profile.bpm,
+                beat_conf=profile.confidence,
+            )
+
+        # The file is indexed in track time, so a seek or a GarageBand loop
+        # lands on the matching pre-analyzed frame immediately.
+        values = profile.sample(pos + BEAT_PREDICT_LOOKAHEAD_SEC)
+        if values is None:
+            return None
+        core = values[:12]
+        (
+            bass, mid, high, rms, pulse, beat,
+            vocal, brightness, spectral_flux, stereo_width,
+            section, section_change,
+        ) = core
+        ahead = profile.sample(pos + 1.25)
+        behind = profile.sample(max(0.0, pos - 0.85))
+        energy_ahead = ahead[3] if ahead is not None else 0.0
+        if ahead is not None and behind is not None:
+            energy_flow = float(np.clip((ahead[3] - behind[3]) * 2.4, -1.0, 1.0))
+            spectral_shift = float(np.clip(
+                ((ahead[2] - ahead[0]) - (behind[2] - behind[0])) * 1.7,
+                -1.0,
+                1.0,
+            ))
+        else:
+            energy_flow = spectral_shift = 0.0
+        music_motion = float(np.clip(
+            0.18 * rms + 0.14 * bass + 0.16 * mid + 0.10 * high
+            + 0.20 * spectral_flux + 0.16 * vocal + 0.10 * stereo_width,
+            0.0,
+            1.0,
+        ))
+        climax = float(np.clip(
+            0.36 * rms + 0.22 * spectral_flux + 0.34 * section_change
+            + 0.20 * pulse + 0.10 * high,
+            0.0,
+            1.0,
+        ))
+        phase = 0.0
+        if profile.bpm > 0:
+            period = 60.0 / profile.bpm
+            phase = ((pos + BEAT_PREDICT_LOOKAHEAD_SEC - profile.beat_offset) % period) / period
+        fine = values[12:36]
+        bands = list(fine) if len(fine) == 24 else ([bass] * 5 + [mid] * 12 + [high] * 7)
+        waveform = list(values[36:100])
+        # Recorded playback can show both sides of the playhead. Twenty-five
+        # traces span six seconds: earlier music, current time, upcoming music.
+        waveform_timeline: List[List[float]] = []
+        timeline_offsets = np.linspace(-3.0, 3.0, 25)
+        for offset in timeline_offsets:
+            sample_time = pos + float(offset)
+            timeline_row = (
+                profile.sample(sample_time)
+                if 0.0 <= sample_time <= profile.duration
+                else None
+            )
+            if timeline_row is not None and len(timeline_row) >= 100:
+                waveform_timeline.append(list(timeline_row[36:100]))
+            else:
+                waveform_timeline.append([0.0] * 64)
+        if len(values) >= 105:
+            track_intensity, buildup, anticipation, drop, calmness = values[100:105]
+        else:
+            track_intensity = music_motion
+            buildup = energy_flow
+            anticipation = drop = 0.0
+            calmness = 1.0 - track_intensity
+        energy_flow = float(np.clip(0.48 * energy_flow + 0.52 * buildup, -1.0, 1.0))
+        music_motion = float(np.clip(
+            0.30 * music_motion + 0.50 * track_intensity
+            + 0.14 * anticipation + 0.18 * drop,
+            0.0,
+            1.0,
+        ))
+        climax = max(climax, float(drop))
+        return AudioLevels(
+            ok=True,
+            silent=rms < 0.004,
+            rms=rms,
+            bass=bass,
+            mid=mid,
+            high=high,
+            pulse=pulse,
+            bands=bands,
+            waveform=waveform,
+            waveform_timeline=waveform_timeline,
+            waveform_timeline_center=len(waveform_timeline) // 2,
+            status="file",
+            source="full-file",
+            bpm=profile.bpm,
+            beat_conf=profile.confidence,
+            beat_phase=phase,
+            beat=beat,
+            energy_ahead=energy_ahead,
+            vocal=vocal,
+            brightness=brightness,
+            spectral_flux=spectral_flux,
+            stereo_width=stereo_width,
+            section=section,
+            section_change=section_change,
+            music_motion=music_motion,
+            energy_flow=energy_flow,
+            spectral_shift=spectral_shift,
+            climax=climax,
+            track_intensity=track_intensity,
+            buildup=buildup,
+            anticipation=anticipation,
+            drop=drop,
+            calmness=calmness,
+        )
 
     def snapshot(self) -> AudioLevels:
         now = time.monotonic()
         dt = max(1e-3, min(0.1, now - self._last_t))
         self._last_t = now
+
+        full = self._full_file_snapshot()
+        if full is not None:
+            return full
 
         if self._stream is None or self._status not in ("ok", "silent"):
             self._sm_rms = self._smooth(self._sm_rms, 0.0, dt, 0.05, 0.6)
@@ -501,6 +709,10 @@ class AudioAnalyzer:
         self._pulse = max(self._pulse * math.exp(-dt / 0.18), min(1.0, onset * 2.4))
 
         bpm, bconf, bphase, beat, e_ahead = self._beat_fields(now, gate_ok=not silent)
+        wave_idx = np.linspace(0, max(0, len(x) - 1), 64).astype(np.int64)
+        wave = x[wave_idx] if len(x) else np.zeros(64, dtype=np.float32)
+        wave_scale = max(1e-6, float(np.percentile(np.abs(wave), 98.0)))
+        wave = np.clip(wave / wave_scale, -1.0, 1.0)
 
         return AudioLevels(
             ok=True,
@@ -511,7 +723,9 @@ class AudioAnalyzer:
             high=self._sm_high,
             pulse=self._pulse,
             bands=[float(b) for b in self._sm_bands],
+            waveform=[float(v) for v in wave],
             status=self._status,
+            source="live",
             bpm=bpm,
             beat_conf=bconf,
             beat_phase=bphase,
@@ -528,22 +742,40 @@ class AudioAnalyzer:
         if self._stream_mono_off is not None:
             q = self._tracker.query(now - self._stream_mono_off)
         with self._track_lock:
-            loaded, profile = self._loaded, self._profile
+            profile, pair = self._full_profile, self._pos_pair
+        file_state = self._files.status()
+        use_file = profile is not None and pair is not None
+        bpm = profile.bpm if use_file else (q.bpm if q else 0.0)
+        conf = profile.confidence if use_file else (q.conf if q else 0.0)
+        period = (60.0 / bpm) if bpm > 0 else 0.0
+        beat_idx = (q.beat_index % 4) if q else 0
+        next_in_ms = ((q.period - q.time_since_beat) * 1000.0) if q else 0.0
+        if use_file and pair is not None and period > 0:
+            pos, _, _ = pair
+            rel = pos - profile.beat_offset
+            beat_idx = int(math.floor(rel / period)) % 4
+            next_in_ms = (period - (rel % period)) * 1000.0
         return {
             "env": env,
             "env_fps": env_fps,
-            "bpm": q.bpm if q else 0.0,
-            "conf": q.conf if q else 0.0,
-            "period": q.period if q else 0.0,
-            "next_in_ms": ((q.period - q.time_since_beat) * 1000.0) if q else 0.0,
-            "beat_idx": (q.beat_index % 4) if q else 0,
+            "bpm": bpm,
+            "conf": conf,
+            "period": period,
+            "next_in_ms": next_in_ms,
+            "beat_idx": beat_idx,
             "lookahead_ms": BEAT_PREDICT_LOOKAHEAD_SEC * 1000.0,
-            "cache": "hit" if loaded is not None else "none",
-            "cache_bpm": loaded.bpm if loaded is not None else 0.0,
-            "profile_cov": profile.coverage if profile is not None else 0.0,
-            "profile_secs": profile.seconds_recorded if profile is not None else 0,
+            "analysis_source": "full-file" if use_file else "live",
+            "record_mode": file_state.get("mode", "idle"),
+            "record_coverage": float(file_state.get("coverage", 0.0) or 0.0),
+            "record_bitrate": int(file_state.get("bitrate", 0) or 0),
+            "record_dropped": int(file_state.get("dropped", 0) or 0),
+            "capture_queue": self._capture_queue.qsize(),
+            "capture_ready": self._capture_ready.is_set(),
+            "capture_dropped": int(self._capture_queue_drops),
+            "input_overflows": int(self._input_overflows),
+            "capture_peak": float(self._capture_peak),
             "device": self._device_name,
             "sr": int(self._samplerate),
-            "status": self._status,
-            "clock_ok": self._stream_mono_off is not None,
+            "status": "file" if use_file else self._status,
+            "clock_ok": use_file or self._stream_mono_off is not None,
         }

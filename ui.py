@@ -27,7 +27,6 @@ from PySide6.QtGui import (
     QLinearGradient,
     QPainter,
     QPainterPath,
-    QPainterPathStroker,
     QPen,
     QPixmap,
     QRadialGradient,
@@ -38,6 +37,7 @@ import now_playing as npc
 from audio import AudioAnalyzer, AudioLevels
 from lyrics import LyricsManager, make_sig
 from now_playing import NowPlaying, NowPlayingState
+from recording import make_audio_signature
 from settings import (
     DEBUG_PANEL_DEFAULT,
     DEFAULT_SHOW_INFO,
@@ -52,7 +52,7 @@ from settings import (
     VIS_DEFAULT_SPHERE,
     VISUALIZER_ENABLED,
 )
-from visualizer import BackgroundVisualizer, SphereVisualizer
+from visualizer import AsyncSphereVisualizer, BackgroundVisualizer
 
 # ---------------------------------------------------------------- helpers
 
@@ -226,45 +226,6 @@ def icon_path(name: str, r: QRectF) -> QPainterPath:
             tri(r.right(), cx - w * 0.02)
             tri(cx + w * 0.02, r.left() + w * 0.14)
             p.addRect(QRectF(r.left(), r.top(), w * 0.10, h))
-    elif name == "shuffle":
-        lw = h * 0.13
-
-        def stroked(pts: List[Tuple[float, float]]) -> QPainterPath:
-            c = QPainterPath()
-            c.moveTo(r.left() + pts[0][0] * w, r.top() + pts[0][1] * h)
-            for px_, py_ in pts[1:]:
-                c.lineTo(r.left() + px_ * w, r.top() + py_ * h)
-            st = QPainterPathStroker()
-            st.setWidth(lw)
-            st.setCapStyle(Qt.RoundCap)
-            st.setJoinStyle(Qt.RoundJoin)
-            return st.createStroke(c)
-
-        p = p.united(stroked([(0.02, 0.78), (0.28, 0.78), (0.64, 0.22), (0.82, 0.22)]))
-        p = p.united(stroked([(0.02, 0.22), (0.28, 0.22), (0.64, 0.78), (0.82, 0.78)]))
-        for ty in (0.22, 0.78):
-            tri = QPainterPath()
-            tri.moveTo(r.left() + 0.80 * w, r.top() + (ty - 0.16) * h)
-            tri.lineTo(r.left() + 1.00 * w, r.top() + ty * h)
-            tri.lineTo(r.left() + 0.80 * w, r.top() + (ty + 0.16) * h)
-            tri.closeSubpath()
-            p = p.united(tri)
-    elif name == "repeat":
-        lw = h * 0.13
-        rr = QRectF(r.left() + lw / 2, r.top() + h * 0.14, w - lw, h * 0.72)
-        ring = QPainterPath()
-        ring.addRoundedRect(rr, h * 0.26, h * 0.26)
-        st = QPainterPathStroker()
-        st.setWidth(lw)
-        st.setCapStyle(Qt.RoundCap)
-        st.setJoinStyle(Qt.RoundJoin)
-        p = st.createStroke(ring)
-        tri = QPainterPath()
-        tri.moveTo(cx - w * 0.06, r.top())
-        tri.lineTo(cx + w * 0.16, r.top() + h * 0.14)
-        tri.lineTo(cx - w * 0.06, r.top() + h * 0.30)
-        tri.closeSubpath()
-        p = p.united(tri)
     return p
 
 
@@ -284,9 +245,9 @@ class LyricsInfoWidget(QWidget):
         self._lyrics = lyrics
         self._audio = audio
         self._vis = vis if VISUALIZER_ENABLED else None
-        self._vis_enabled = self._vis is not None
-        self._sphere = SphereVisualizer() if VISUALIZER_ENABLED else None
+        self._sphere = AsyncSphereVisualizer() if VISUALIZER_ENABLED else None
         self._sphere_mode: bool = VIS_DEFAULT_SPHERE and self._sphere is not None
+        self._style_notice_until = 0.0
         if self._sphere is not None:
             self._sphere.set_mode(self._sphere_mode)
 
@@ -321,6 +282,10 @@ class LyricsInfoWidget(QWidget):
         self._bar_rect = QRectF()
         self._dragging_bar = False
         self._drag_frac = 0.0
+        self._visual_rect = QRectF()
+        self._dragging_visual = False
+        self._visual_drag_last = QPointF()
+        self._visual_drag_last_t = 0.0
         self._seek_preview_until = 0.0
         self._seek_preview_pos = 0.0
         self._last_mouse_move = time.monotonic()
@@ -340,8 +305,13 @@ class LyricsInfoWidget(QWidget):
         self._show_info = not self._show_info
 
     def toggle_visualizer(self) -> None:
-        if self._vis is not None:
-            self._vis_enabled = not self._vis_enabled
+        if self._sphere is not None:
+            self._sphere_mode = not self._sphere_mode
+            self._sphere.set_mode(self._sphere_mode)
+
+    def shutdown(self) -> None:
+        if self._sphere is not None:
+            self._sphere.stop()
 
     # ------------------------------------------------------------ fonts
 
@@ -416,6 +386,7 @@ class LyricsInfoWidget(QWidget):
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
 
         w, h = float(self.width()), float(self.height())
+        self._visual_rect = QRectF()
 
         np_: Optional[NowPlaying] = None
         pos = 0.0
@@ -429,20 +400,38 @@ class LyricsInfoWidget(QWidget):
             pos = self._seek_preview_pos
 
         # Feed the beat engine the track identity + live position so it can
-        # warm-start from the analysis cache and record the track profile.
+        # write exact now-playing file boundaries and sync a completed file.
         if self._audio is not None and np_ is not None:
-            if hasattr(self._audio, "note_position"):
-                self._audio.note_position(pos)
             if (
-                np_.title and np_.artist and np_.duration_seconds
+                np_.title and np_.duration_seconds
                 and hasattr(self._audio, "set_track")
             ):
-                a_sig = make_sig(
-                    np_.title, np_.artist, np_.album or "", int(round(np_.duration_seconds))
+                a_sig = make_audio_signature(
+                    np_.title, np_.artist or "", np_.album or "", np_.duration_seconds
                 )
                 if a_sig != self._audio_sig:
                     self._audio_sig = a_sig
-                    self._audio.set_track(a_sig, np_.duration_seconds)
+                    self._audio.set_track(
+                        a_sig,
+                        np_.duration_seconds,
+                        title=np_.title,
+                        artist=np_.artist or "",
+                        album=np_.album or "",
+                        genre=np_.genre or "",
+                        track_number=np_.track_number,
+                        total_track_count=np_.total_track_count,
+                        source_app=str(np_.raw.get("bundleIdentifier") or ""),
+                        content_identifier=str(
+                            np_.raw.get("contentItemIdentifier")
+                            or np_.raw.get("uniqueIdentifier")
+                            or ""
+                        ),
+                    )
+            if hasattr(self._audio, "note_position"):
+                playing = self._np_state.effective_playing() if self._np_state else np_.is_playing
+                self._audio.note_position(pos, playing=bool(playing))
+            if np_.artwork_bytes and hasattr(self._audio, "note_artwork"):
+                self._audio.note_artwork(np_.artwork_bytes)
 
         levels = self._audio.snapshot() if self._audio else AudioLevels()
 
@@ -466,7 +455,9 @@ class LyricsInfoWidget(QWidget):
             self._vis_art_key = art_sig
 
         morph = self._sphere.morph_value() if self._sphere is not None else 0.0
-        if self._vis is not None and self._vis_enabled:
+        # The artwork-derived wash is a permanent stage. V only toggles the
+        # foreground geometry, so selecting a mode never blanks the backdrop.
+        if self._vis is not None:
             self._vis.render(painter, int(w), int(h), now, levels)
         else:
             painter.fillRect(self.rect(), QColor(12, 12, 20))
@@ -511,19 +502,22 @@ class LyricsInfoWidget(QWidget):
         self._art_pulse.target = levels.beat if levels.ok else 0.0
         pulse = self._art_pulse.update(dt)
 
-        # ---- info column ----
-        if self._show_info:
-            self._draw_info_column(painter, np_, pos, artwork, w, h, e, pulse, now, err, levels)
-        else:
-            self._buttons.clear()
-            self._bar_rect = QRectF()
-            if self._sphere is not None and (self._sphere_mode or self._sphere.morph_value() > 0.001):
-                # Info hidden: the globe becomes the ambient centerpiece.
-                s = min(h * 0.62, w * 0.45)
-                scx = lerp(w * 0.5, w * 0.26, e)
-                self._sphere.render(
-                    painter, QRectF(scx - s / 2, h * 0.5 - s / 2, s, s), now, levels
-                )
+        # Artwork/animation is the persistent centerpiece. I hides only its
+        # information and transport controls, never the visual itself.
+        self._draw_info_column(
+            painter,
+            np_,
+            pos,
+            artwork,
+            w,
+            h,
+            e,
+            pulse,
+            now,
+            err,
+            levels,
+            controls_visible=self._show_info,
+        )
 
         # ---- lyrics panel ----
         vis = e * lyr_alpha
@@ -574,6 +568,7 @@ class LyricsInfoWidget(QWidget):
         now: float,
         err: Optional[str],
         levels: Optional[AudioLevels] = None,
+        controls_visible: bool = True,
     ) -> None:
         art_c = min(h * 0.46, w * 0.34)
         art_s = min(h * 0.42, w * 0.24)
@@ -633,13 +628,19 @@ class LyricsInfoWidget(QWidget):
 
         if self._sphere is not None and (self._sphere_mode or morph > 0.001):
             pad = art_size * 0.10
+            self._visual_rect = art_rect.adjusted(-pad, -pad, pad, pad)
             self._sphere.render(
                 painter,
-                art_rect.adjusted(-pad, -pad, pad, pad),
+                self._visual_rect,
                 now,
                 levels if levels is not None else AudioLevels(),
                 img_rect=art_rect,
             )
+
+        if not controls_visible:
+            self._buttons.clear()
+            self._bar_rect = QRectF()
+            return
 
         # --- text info ---
         col_w = art_size
@@ -719,7 +720,6 @@ class LyricsInfoWidget(QWidget):
     def _draw_controls(
         self, painter: QPainter, np_: NowPlaying, cx: float, y: float, h: float, now: float
     ) -> None:
-        small = h * 0.020
         med = h * 0.026
         big = h * 0.034
         gap = h * 0.052
@@ -730,16 +730,14 @@ class LyricsInfoWidget(QWidget):
         if playing is None:
             playing = bool(np_.is_playing)
 
-        names = ["shuffle", "prev", "playpause", "next", "repeat"]
-        sizes = {"shuffle": small, "prev": med, "playpause": big, "next": med, "repeat": small}
+        names = ["prev", "playpause", "next"]
+        sizes = {"prev": med, "playpause": big, "next": med}
 
         cy = y + big / 2.0
         xs = {
-            "shuffle": cx - gap * 2.0,
             "prev": cx - gap,
             "playpause": cx,
             "next": cx + gap,
-            "repeat": cx + gap * 2.0,
         }
 
         self._buttons.clear()
@@ -782,12 +780,9 @@ class LyricsInfoWidget(QWidget):
         dt: float,
         now: float,
     ) -> None:
-        if self._show_info or self._sphere_mode:
-            # In sphere mode the globe keeps the left half even when the
-            # info column is hidden.
-            panel_x = w * 0.475
-        else:
-            panel_x = w * 0.14
+        # The persistent artwork/animation owns the left half even when I has
+        # hidden the title and transport controls.
+        panel_x = w * 0.475
         panel_w = w * (1.0 - LYRICS_PANEL_RIGHT_MARGIN_FRAC) - panel_x
         panel_y = h * 0.10
         panel_h = h * 0.80
@@ -1010,7 +1005,15 @@ class LyricsInfoWidget(QWidget):
             painter.drawText(
                 QRectF(w * 0.02, h - fm.height() * 3.6, w * 0.96, fm.height()),
                 Qt.AlignLeft | Qt.AlignVCenter,
-                "Space play/pause    ⇤ ⇥ track    F fullscreen    S sphere    L lyrics    I info    V visualizer    D debug    Q quit",
+                "Space play/pause    ⇤ ⇥ track    Drag orbit    F fullscreen    V animation    1–9 style    L lyrics    I info    D debug    Q quit",
+            )
+        if now < self._style_notice_until and self._sphere is not None:
+            remain = clamp((self._style_notice_until - now) / 0.35, 0.0, 1.0)
+            painter.setPen(QPen(QColor(255, 255, 255, int(190 * remain))))
+            painter.drawText(
+                QRectF(w * 0.20, h * 0.055, w * 0.60, fm.height() * 1.4),
+                Qt.AlignCenter,
+                f"{self._sphere.style()}  {self._sphere.style_name()}",
             )
 
     # ------------------------------------------------------------ debug panel
@@ -1042,7 +1045,7 @@ class LyricsInfoWidget(QWidget):
         spark_h = base_px * 4.4
         meters_h = base_px * 4.0
         ph = (pad * 2 + fm_s.height() * 1.3 + fm_b.height() + base_px * 2.4
-              + spark_h + row * 4 + meters_h + base_px * 2.2)
+              + spark_h + row * 6 + meters_h + base_px * 2.2)
         x = w - pw - w * 0.015
         y = h * 0.075
 
@@ -1156,16 +1159,27 @@ class LyricsInfoWidget(QWidget):
         painter.setFont(f_small)
         painter.setPen(QPen(QColor(255, 255, 255, 150)))
         period_ms = float(dbg.get("period", 0.0)) * 1000.0
+        bitrate = float(dbg.get("record_bitrate", 0.0)) / 1_000_000.0
+        record_mode = str(dbg.get("record_mode", "idle"))
+        source = str(dbg.get("analysis_source", levels.source))
+        capture_peak = float(dbg.get("capture_peak", 0.0) or 0.0)
+        peak_db = 20.0 * math.log10(max(capture_peak, 1e-12))
         rows = [
             f"next beat {float(dbg.get('next_in_ms', 0)):4.0f} ms   lookahead {float(dbg.get('lookahead_ms', 0)):3.0f} ms",
             f"period {period_ms:6.1f} ms   clock {'ok' if clock_ok else '--'}",
+            f"source {source:<9}   audio {float(dbg.get('record_coverage', 0)) * 100:5.1f}%",
             (
-                f"tempo cache HIT {float(dbg.get('cache_bpm', 0)):.1f}"
-                if dbg.get("cache") == "hit"
-                else "tempo cache --"
-            )
-            + f"   profile {float(dbg.get('profile_cov', 0)) * 100:3.0f}% ({int(dbg.get('profile_secs', 0))}s)",
-            f"{str(dbg.get('device', ''))[:22]} @ {int(dbg.get('sr', 0))}   {status}",
+                f"song I {levels.track_intensity:.2f}  build {levels.buildup:+.2f}  "
+                f"pre {levels.anticipation:.2f}  HIT {levels.drop:.2f}"
+            ),
+            (
+                f"{record_mode[:18]:<18} {bitrate:4.1f} Mbps  "
+                f"lost {int(dbg.get('record_dropped', 0))}/{int(dbg.get('capture_dropped', 0))}"
+            ),
+            (
+                f"in {peak_db:5.1f} dB  q {int(dbg.get('capture_queue', 0)):3d}  "
+                f"xrun {int(dbg.get('input_overflows', 0))}  {status}"
+            ),
         ]
         for r in rows:
             yy += row
@@ -1213,6 +1227,18 @@ class LyricsInfoWidget(QWidget):
         if self._dragging_bar and self._bar_rect.width() > 0:
             self._drag_frac = clamp((p.x() - self._bar_rect.left()) / self._bar_rect.width(), 0.0, 1.0)
             return
+        if self._dragging_visual and self._sphere is not None:
+            now = time.monotonic()
+            delta = p - self._visual_drag_last
+            self._sphere.drag_view(
+                delta.x(),
+                delta.y(),
+                now - self._visual_drag_last_t,
+            )
+            self._visual_drag_last = QPointF(p)
+            self._visual_drag_last_t = now
+            self.setCursor(Qt.ClosedHandCursor)
+            return
         hover = ""
         for name, rect in self._buttons.items():
             if rect.contains(p):
@@ -1220,9 +1246,19 @@ class LyricsInfoWidget(QWidget):
                 break
         if not hover and self._bar_rect.contains(p):
             hover = "bar"
+        if (
+            not hover
+            and self._sphere is not None
+            and self._sphere_mode
+            and self._visual_rect.contains(p)
+        ):
+            hover = "visual"
         if hover != self._hover:
             self._hover = hover
-        self.setCursor(Qt.PointingHandCursor if hover else Qt.ArrowCursor)
+        if hover == "visual":
+            self.setCursor(Qt.OpenHandCursor)
+        else:
+            self.setCursor(Qt.PointingHandCursor if hover else Qt.ArrowCursor)
         if not hover and self._cursor_hidden:
             self.unsetCursor()
 
@@ -1238,6 +1274,18 @@ class LyricsInfoWidget(QWidget):
             self._dragging_bar = True
             self._drag_frac = clamp((p.x() - self._bar_rect.left()) / self._bar_rect.width(), 0.0, 1.0)
             return
+        if (
+            event.button() == Qt.LeftButton
+            and self._sphere is not None
+            and self._sphere_mode
+            and self._visual_rect.contains(p)
+        ):
+            self._dragging_visual = True
+            self._visual_drag_last = QPointF(p)
+            self._visual_drag_last_t = time.monotonic()
+            self._sphere.begin_drag()
+            self.setCursor(Qt.ClosedHandCursor)
+            return
         self._pressed = ""
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
@@ -1251,6 +1299,14 @@ class LyricsInfoWidget(QWidget):
                 npc.seek(target)
                 self._seek_preview_pos = target
                 self._seek_preview_until = time.monotonic() + 1.2
+            return
+        if self._dragging_visual:
+            self._dragging_visual = False
+            if self._sphere is not None:
+                self._sphere.end_drag()
+            self.setCursor(
+                Qt.OpenHandCursor if self._visual_rect.contains(p) else Qt.ArrowCursor
+            )
             return
         if self._pressed and self._buttons.get(self._pressed, QRectF()).contains(p):
             self._activate_button(self._pressed)
@@ -1274,10 +1330,6 @@ class LyricsInfoWidget(QWidget):
             npc.send_command("next-track")
         elif name == "prev":
             npc.send_command("previous-track")
-        elif name == "shuffle":
-            npc.send_command("toggle-shuffle")
-        elif name == "repeat":
-            npc.send_command("toggle-repeat")
 
     def handle_key(self, key: int) -> bool:
         if key == Qt.Key_Space:
@@ -1295,10 +1347,16 @@ class LyricsInfoWidget(QWidget):
         if key == Qt.Key_V:
             self.toggle_visualizer()
             return True
-        if key == Qt.Key_S:
+        number_keys = (
+            Qt.Key_1, Qt.Key_2, Qt.Key_3, Qt.Key_4, Qt.Key_5,
+            Qt.Key_6, Qt.Key_7, Qt.Key_8, Qt.Key_9,
+        )
+        if key in number_keys:
             if self._sphere is not None:
-                self._sphere_mode = not self._sphere_mode
-                self._sphere.set_mode(self._sphere_mode)
+                self._sphere.set_style(number_keys.index(key) + 1)
+                self._sphere_mode = True
+                self._sphere.set_mode(True)
+                self._style_notice_until = time.monotonic() + 1.35
             return True
         if key == Qt.Key_L:
             self._show_lyrics = not self._show_lyrics

@@ -21,24 +21,18 @@ Pipeline (all causal, cheap enough for a background thread):
 The tracker works in "stream time" (seconds of audio consumed); the caller
 maintains the stream->monotonic mapping.
 
-AnalysisCache persists {track sig: bpm} so a song's second play locks
-instantly (the tempo prior is seeded before the first beat even lands).
+Saved-track analysis lives beside each recorded audio file; this module only
+owns the causal live tracker.
 """
 
-import json
 import math
-import os
-import tempfile
-import time
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
 from settings import (
-    ANALYSIS_CACHE_MAX_ENTRIES,
-    ANALYSIS_CACHE_PATH,
     BEAT_MAX_BPM,
     BEAT_MIN_BPM,
 )
@@ -87,8 +81,8 @@ class BeatTracker:
     # ------------------------------------------------------------ input
 
     def set_prior_bpm(self, bpm: float) -> None:
-        """Seed tempo from the analysis cache: the grid starts at this period
-        immediately (low confidence) and the comb only has to find phase."""
+        """Seed a tempo prior: the grid starts at this period immediately
+        (low confidence) and the comb only has to find phase."""
         with self._lock:
             if bpm and BEAT_MIN_BPM <= bpm <= BEAT_MAX_BPM * 1.05:
                 self._prior_bpm = float(bpm)
@@ -321,154 +315,3 @@ class BeatTracker:
     def stream_time(self) -> float:
         with self._lock:
             return self._frames * HOP / self._sr
-
-
-# ---------------------------------------------------------------- profile
-
-
-class TrackProfile:
-    """
-    Per-track analysis 'signature' — derived data only, never audio:
-      * tempo (bpm) + confidence
-      * beat grid phase expressed in TRACK time (`beat_offset`), so a replay
-        can place beats correctly from the current playback position alone
-      * 1s-resolution energy profile (bass/mid/high/rms, quantized to 0..255)
-        so visuals can anticipate loud sections the next time the song plays
-    """
-
-    BANDS = ("bass", "mid", "high", "rms")
-    RES_SEC = 1.0
-
-    def __init__(self, sig: str, duration_sec: int) -> None:
-        self.sig = sig
-        self.duration = max(1, int(duration_sec))
-        n = self.duration + 2
-        self._acc = np.zeros((4, n), dtype=np.float64)
-        self._cnt = np.zeros(n, dtype=np.int64)
-
-    def add_sample(self, pos_sec: float, bass: float, mid: float, high: float, rms: float) -> None:
-        i = int(pos_sec / self.RES_SEC)
-        if 0 <= i < self._acc.shape[1]:
-            self._acc[:, i] += (bass, mid, high, rms)
-            self._cnt[i] += 1
-
-    @property
-    def coverage(self) -> float:
-        return float(np.count_nonzero(self._cnt[: self.duration])) / max(1, self.duration)
-
-    @property
-    def seconds_recorded(self) -> int:
-        return int(np.count_nonzero(self._cnt))
-
-    def bands_entry(self) -> Dict[str, List[int]]:
-        cnt = np.maximum(1, self._cnt)
-        avg = self._acc / cnt
-        out = {}
-        for bi, name in enumerate(self.BANDS):
-            q = np.clip(np.round(avg[bi] * 255.0), 0, 255).astype(int)
-            q[self._cnt == 0] = 0
-            out[name] = q[: self.duration].tolist()
-        return out
-
-
-class LoadedProfile:
-    """Read-only view of a cached entry for playback-time anticipation."""
-
-    def __init__(self, entry: Dict[str, Any]) -> None:
-        self.bpm = float(entry.get("bpm") or 0.0)
-        self.conf = float(entry.get("conf") or 0.0)
-        self.beat_offset = entry.get("beat_offset")  # track-time of a beat, sec
-        self.duration = int(entry.get("duration") or 0)
-        self._bands: Dict[str, np.ndarray] = {}
-        bands = entry.get("bands")
-        if isinstance(bands, dict):
-            for name in TrackProfile.BANDS:
-                arr = bands.get(name)
-                if isinstance(arr, list) and arr:
-                    self._bands[name] = np.array(arr, dtype=np.float64) / 255.0
-
-    @property
-    def has_energy(self) -> bool:
-        return bool(self._bands)
-
-    def energy_at(self, pos_sec: float, band: str = "rms") -> Optional[float]:
-        arr = self._bands.get(band)
-        if arr is None or len(arr) == 0:
-            return None
-        i = int(pos_sec / TrackProfile.RES_SEC)
-        if i < 0 or i >= len(arr):
-            return None
-        v = float(arr[i])
-        return v if v > 0.0 else None
-
-
-# ---------------------------------------------------------------- cache
-
-
-class AnalysisCache:
-    """Persistent map: track signature -> TrackProfile data. Lets a repeat
-    play lock tempo AND beat phase before a single beat has hit."""
-
-    def __init__(self, path: str = ANALYSIS_CACHE_PATH) -> None:
-        self._path = path
-        self._lock = Lock()
-
-    def _read(self) -> Dict[str, Any]:
-        try:
-            with open(self._path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
-        return {}
-
-    def load(self, sig: str) -> Optional[LoadedProfile]:
-        entry = self._read().get(sig)
-        if isinstance(entry, dict) and float(entry.get("bpm") or 0.0) > 0:
-            return LoadedProfile(entry)
-        return None
-
-    def save(
-        self,
-        sig: str,
-        bpm: float,
-        conf: float,
-        beat_offset: Optional[float] = None,
-        profile: Optional[TrackProfile] = None,
-        duration: int = 0,
-    ) -> None:
-        if not sig or bpm <= 0:
-            return
-        with self._lock:
-            data = self._read()
-            old = data.get(sig) if isinstance(data.get(sig), dict) else {}
-            entry: Dict[str, Any] = dict(old)
-            # Keep the higher-confidence tempo measurement.
-            if conf >= float(old.get("conf", 0.0)) - 0.05:
-                entry["bpm"] = round(float(bpm), 2)
-                entry["conf"] = round(float(conf), 3)
-                if beat_offset is not None:
-                    entry["beat_offset"] = round(float(beat_offset), 4)
-            if profile is not None and profile.seconds_recorded >= 15:
-                old_cov = float(old.get("coverage", 0.0))
-                if profile.coverage >= old_cov - 0.02:
-                    entry["bands"] = profile.bands_entry()
-                    entry["coverage"] = round(profile.coverage, 3)
-            entry["duration"] = int(duration or old.get("duration") or 0)
-            entry["saved_at"] = time.time()
-            entry["plays"] = int(old.get("plays", 0)) + (0 if old else 1)
-            data[sig] = entry
-
-            if len(data) > ANALYSIS_CACHE_MAX_ENTRIES:
-                items = sorted(data.items(), key=lambda kv: float((kv[1] or {}).get("saved_at", 0)))
-                for k, _ in items[: len(data) - ANALYSIS_CACHE_MAX_ENTRIES]:
-                    data.pop(k, None)
-            try:
-                d = os.path.dirname(os.path.abspath(self._path)) or "."
-                fd, tmp = tempfile.mkstemp(prefix=".analysis_", dir=d)
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-                os.replace(tmp, self._path)
-            except Exception:
-                pass

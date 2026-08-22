@@ -94,6 +94,7 @@ def main() -> None:
         window.show()
 
     def on_about_to_quit() -> None:
+        widget.shutdown()
         if lyrics_mgr is not None:
             lyrics_mgr.stop()
         if audio is not None:
